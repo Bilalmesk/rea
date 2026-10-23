@@ -1,4 +1,8 @@
 import { Il2cppBinaryFormatFailure } from "../../../src/il2cpp/Il2cppBinaryFormat.js";
+import {
+  openImageSteps,
+  readUInt32,
+} from "../../../src/il2cpp/Il2cppBinaryImage.js";
 import { expect, it } from "vitest";
 import {
   linkIl2cppBinary,
@@ -9,6 +13,7 @@ import {
   createElfFixture,
   createIl2cppBinaryFixture,
   createIl2cppDyldBindFixture,
+  createIl2cppRegistrationTailFixture,
   createUniversalFixture,
   createSplitPointerPeFixture,
   FIXTURE_BINARY_BASE,
@@ -181,6 +186,37 @@ it("requires an explicit slice of a universal Mach-O and reads only that slice",
   expect(failure(universal, "ppc64").reason).toBe("slice-not-found");
   expect(failure(thin, "arm64").reason).toBe("slice-not-found");
 });
+
+it.each(["thin", "universal"] as const)(
+  "links a %s x86-64 Mach-O while retaining the reader's amd64 spelling",
+  (format) => {
+    const thin = createIl2cppBinaryFixture();
+    thin.writeUInt32LE(0x01000007, 4);
+    thin.writeUInt32LE(3, 8);
+    const bytes =
+      format === "thin"
+        ? thin
+        : createUniversalFixture([
+            { cpu: 0x0100000c, bytes: createIl2cppBinaryFixture() },
+            { cpu: 0x01000007, bytes: thin },
+          ]);
+    // Match the selected FAT declaration to CPU_SUBTYPE_X86_64_ALL in its header.
+    if (format === "universal") bytes.writeUInt32BE(3, 8 + 20 + 4);
+    const original = Buffer.from(bytes);
+    const linked = link(bytes, format === "thin" ? undefined : "amd64");
+    expect(linked).toMatchObject({
+      format: "macho",
+      architecture: "amd64",
+      code_gen_modules_field: FIXTURE_BINARY_BASE + 0x600n,
+      code_gen_modules_array: FIXTURE_BINARY_BASE + 0x500n,
+    });
+    expect(linked.method_addresses).toEqual(expectedAddresses);
+    expect(linked.return_types).toEqual(
+      link(createIl2cppBinaryFixture()).return_types,
+    );
+    expect(bytes).toEqual(original);
+  },
+);
 
 it.each<
   [string, Il2cppBinaryFixtureOptions, string, "unsupported" | "malformed"]
@@ -593,6 +629,71 @@ it("keeps unbound Mach-O method words classified from their values", () => {
   expect(linked.method_addresses[1]).toEqual(expectedAddresses[1]);
   expect(linked.method_addresses[4]).toEqual(expectedAddress("no-body"));
 });
+it("refuses an unresolved inner type value instead of rendering its stored placeholder", () => {
+  expect(
+    failure(createIl2cppDyldBindFixture(FIXTURE_BINARY_BASE + 0x990n, 0x980)),
+  ).toEqual({
+    reason: "unsupported-pointer-encoding",
+    kind: "unsupported",
+  });
+});
+it.each([
+  [0x600, 2n, "code-registration-not-found"],
+  [0x408, 3n, "code-gen-modules-not-found"],
+  [0x850, 4n, "metadata-registration-not-found"],
+  [0x860, 4n, "metadata-registration-not-found"],
+  [0x988, 0x001d0000n, "unsupported-pointer-encoding"],
+] as const)("does not trust a dyld-owned scalar at %s", (slot, raw, reason) => {
+  expect(failure(createIl2cppDyldBindFixture(raw, slot)).reason).toBe(reason);
+});
+it.each([
+  [0x5f8, 0n, 2],
+  [0x5fc, 2n << 32n, "unknown"],
+  [0x600, 2n, "unknown"],
+  [0x604, 0n, 2],
+] as const)(
+  "uses the four-byte count span for a dyld bind at %s",
+  (slot, raw, expected) => {
+    const steps = openImageSteps(
+      createIl2cppDyldBindFixture(raw, slot),
+      undefined,
+    );
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    expect(readUInt32(step.value, FIXTURE_BINARY_BASE + 0x600n)).toBe(expected);
+  },
+);
+it.each([
+  [0x400, "code-gen-modules-not-found"],
+  [0x410, "code-gen-modules-not-found"],
+  [0x500, "code-registration-not-found"],
+  [0x608, "code-registration-not-found"],
+  [0x838, "metadata-registration-not-found"],
+] as const)(
+  "does not nominate a registration from dyld-owned word at %s",
+  (slot, reason) => {
+    const raw = createIl2cppBinaryFixture().readBigUInt64LE(slot);
+    expect(failure(createIl2cppDyldBindFixture(raw, slot)).reason).toBe(reason);
+  },
+);
+it.each([1, 0xff])(
+  "ignores ABI count padding byte %d without accepting a changed count",
+  (padding) => {
+    const bytes = createIl2cppBinaryFixture();
+    bytes.fill(padding, 0x604, 0x608);
+    expect(link(bytes)).toEqual(link(createIl2cppBinaryFixture()));
+    bytes.writeUInt32LE(3, 0x600);
+    expect(failure(bytes).reason).toBe("code-registration-not-found");
+  },
+);
+it.each([8, 16] as const)(
+  "rejects %d absent registration bytes without declared zero-fill",
+  (tailBytes) => {
+    expect(
+      failure(createIl2cppRegistrationTailFixture(tailBytes, false)).reason,
+    ).toBe("metadata-registration-not-found");
+  },
+);
 
 it.each([
   ["PC32", 2],
@@ -670,3 +771,59 @@ it("reads type attributes without requiring file-backed alignment padding", () =
     Array.from({ length: 5 }, () => "int"),
   );
 });
+
+it("ignores CodeRegistration count alignment padding", () => {
+  const bytes = createIl2cppBinaryFixture();
+  bytes.fill(0xff, 0x604, 0x608);
+  expect(link(bytes).method_addresses).toEqual(expectedAddresses);
+});
+
+it.each([0, 8, 16])(
+  "finds registration with %s file-backed trailing zero bytes",
+  (tail) => {
+    const original = createIl2cppBinaryFixture();
+    const bytes = Buffer.alloc(0x1000 + tail);
+    original.copy(bytes);
+    original.copy(bytes, 0xf90, 0x800, 0x880);
+    bytes.fill(0, 0x800, 0x880);
+    bytes.writeBigUInt64LE(0x2000n, 64);
+    bytes.writeBigUInt64LE(BigInt(bytes.length), 80);
+    const linked = link(bytes);
+    expect(linked.types_field).toBe(FIXTURE_BINARY_BASE + 0xfc0n);
+    expect(linked.method_addresses).toEqual(expectedAddresses);
+    expect(linked.return_types).toEqual(link(original).return_types);
+    if (tail === 0) {
+      const missingTail = Buffer.from(bytes);
+      missingTail.writeBigUInt64LE(BigInt(bytes.length), 64);
+      expect(failure(missingTail).reason).toBe(
+        "metadata-registration-not-found",
+      );
+    }
+  },
+);
+
+it.each([0n, FIXTURE_BINARY_BASE + 0x980n, FIXTURE_BINARY_BASE + 0x9b0n])(
+  "retains unknown dyld-bound type names regardless of raw word %s",
+  (raw) => {
+    const control = link(createIl2cppBinaryFixture());
+    expect(control.return_types[0]).toEqual({
+      type: 0,
+      name: FIXTURE_RETURN_TYPE_NAME,
+    });
+    expect(control.method_addresses).toEqual(expectedAddresses);
+    const bytes = createIl2cppDyldBindFixture(raw, 0x900);
+    const linked = link(bytes);
+    for (const collection of [
+      "return_types",
+      "field_types",
+      "parameter_types",
+    ] as const)
+      expect(linked[collection]).toEqual(
+        control[collection].map((row) =>
+          row.type === 0 ? { type: row.type, name: null } : row,
+        ),
+      );
+    expect(linked.method_addresses).toEqual(control.method_addresses);
+    expect(bytes.readBigUInt64LE(0x900)).toBe(raw);
+  },
+);
